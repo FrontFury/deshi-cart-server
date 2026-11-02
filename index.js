@@ -32,6 +32,7 @@ let userCollection;
 let productCollection;
 let orderCollection;
 let cartCollection;
+let wishlistCollection;
 let sessionCollection;
 let customerProfileCollection;
 let sellerProfileCollection;
@@ -61,6 +62,7 @@ export async function connectToMongoDB() {
       productCollection = db.collection("products");
       orderCollection = db.collection("orders");
       cartCollection = db.collection("cart");
+      wishlistCollection = db.collection("wishlist");
       customerProfileCollection = db.collection("customer_profiles");
       sellerProfileCollection = db.collection("seller_profiles");
       sessionCollection = db.collection("sessions");
@@ -136,6 +138,23 @@ const verifyAdmin = async (req, res, next) => {
   next();
 };
 
+const attachUserIfAuthenticated = async (req, _res, next) => {
+  const authHeader = req.headers?.authorization;
+  if (!authHeader) {
+    return next();
+  }
+
+  try {
+    const token = authHeader.split(" ")[1];
+    if (!token) return next();
+    const decodedToken = await firebaseAuth.verifyIdToken(token);
+    req.user = await userCollection.findOne({ email: decodedToken.email });
+  } catch {
+    req.user = undefined;
+  }
+  next();
+};
+
 // Base Route
 app.get("/", (req, res) => {
   res.send("DeshiMart Server is Running Successfully with Cart! 🛍️🛒");
@@ -207,16 +226,30 @@ app.get("/api/users/role/:email", verifyToken, async (req, res) => {
 
 // ================= PRODUCT API ROUTES =================
 
-app.get("/api/products", async (req, res) => {
+app.get("/api/products", attachUserIfAuthenticated, async (req, res) => {
   try {
     const query = {};
+    const requestedStatus = req.query.status;
+    const isAdmin = req.user?.role === "admin";
+
+    if (requestedStatus === "pending" && !isAdmin) {
+      return res.status(403).send({ success: false, message: "Admin access required" });
+    }
+
     if (req.query.category) {
       query.category = req.query.category;
     }
     if (req.query.sellerEmail) {
+      if (!req.user || (req.user.email !== req.query.sellerEmail && !isAdmin)) {
+        return res.status(403).send({ success: false, message: "You can only view your own products" });
+      }
       query.sellerEmail = req.query.sellerEmail;
+    } else if (requestedStatus) {
+      query.status = requestedStatus;
+    } else {
+      query.status = "approved";
     }
-    const products = await productCollection.find(query).toArray();
+    const products = await productCollection.find(query).sort({ createdAt: -1 }).toArray();
     res.send(products);
   } catch (error) {
     res
@@ -230,12 +263,35 @@ app.post("/api/products", verifyToken, async (req, res) => {
     const product = {
       ...req.body,
       sellerEmail: req.user.email,
+      status: "pending",
     };
     product.createdAt = new Date();
     const result = await productCollection.insertOne(product);
     res.status(201).send({ success: true, insertedId: result.insertedId });
   } catch (error) {
     res.status(500).send({ success: false, message: "Failed to add product" });
+  }
+});
+
+app.patch("/api/products/:id/status", verifyToken, verifyAdmin, async (req, res) => {
+  try {
+    const { status } = req.body;
+    if (!["approved", "rejected"].includes(status)) {
+      return res.status(400).send({ success: false, message: "Invalid product status" });
+    }
+
+    const result = await productCollection.updateOne(
+      { _id: new ObjectId(req.params.id), status: "pending" },
+      { $set: { status, reviewedAt: new Date(), reviewedBy: req.user.email } },
+    );
+
+    if (!result.matchedCount) {
+      return res.status(404).send({ success: false, message: "Pending product not found" });
+    }
+
+    res.send({ success: true, modifiedCount: result.modifiedCount });
+  } catch (error) {
+    res.status(500).send({ success: false, message: "Failed to update product status" });
   }
 });
 
@@ -267,6 +323,26 @@ app.post("/api/cart", verifyToken, async (req, res) => {
         success: true,
         message: "Cart item quantity updated",
         result,
+      });
+
+      app.patch("/api/cart/:id", verifyToken, async (req, res) => {
+        try {
+          const quantity = Number(req.body.quantity);
+          if (!ObjectId.isValid(req.params.id) || !Number.isInteger(quantity) || quantity < 1) {
+            return res.status(400).send({ success: false, message: "A valid quantity is required" });
+          }
+
+          const result = await cartCollection.updateOne(
+            { _id: new ObjectId(req.params.id), email: req.user.email },
+            { $set: { quantity } },
+          );
+          if (!result.matchedCount) {
+            return res.status(404).send({ success: false, message: "Cart item not found" });
+          }
+          res.send({ success: true, modifiedCount: result.modifiedCount });
+        } catch (error) {
+          res.status(500).send({ success: false, message: "Failed to update cart item" });
+        }
       });
     } else {
       // Insert new cart item
@@ -362,6 +438,60 @@ app.delete("/api/cart", verifyToken, async (req, res) => {
       success: true,
       message: "Cart cleared successfully",
       deletedCount: result.deletedCount,
+    });
+
+    app.get("/api/wishlist", verifyToken, async (req, res) => {
+      try {
+        const items = await wishlistCollection.find({ email: req.user.email }).sort({ createdAt: -1 }).toArray();
+        res.send(items);
+      } catch (error) {
+        res.status(500).send({ success: false, message: "Failed to fetch wishlist" });
+      }
+    });
+
+    app.post("/api/wishlist", verifyToken, async (req, res) => {
+      try {
+        const { productId, name, category, price, image } = req.body;
+        if (!productId || !name || !image) {
+          return res.status(400).send({ success: false, message: "Product details are required" });
+        }
+
+        const existing = await wishlistCollection.findOne({ email: req.user.email, productId });
+        if (existing) {
+          return res.status(409).send({ success: false, message: "Product is already in your wishlist" });
+        }
+
+        const result = await wishlistCollection.insertOne({
+          email: req.user.email,
+          productId,
+          name,
+          category,
+          price,
+          image,
+          createdAt: new Date(),
+        });
+        res.status(201).send({ success: true, insertedId: result.insertedId });
+      } catch (error) {
+        res.status(500).send({ success: false, message: "Failed to add to wishlist" });
+      }
+    });
+
+    app.delete("/api/wishlist/:id", verifyToken, async (req, res) => {
+      try {
+        if (!ObjectId.isValid(req.params.id)) {
+          return res.status(400).send({ success: false, message: "Invalid wishlist item ID" });
+        }
+        const result = await wishlistCollection.deleteOne({
+          _id: new ObjectId(req.params.id),
+          email: req.user.email,
+        });
+        if (!result.deletedCount) {
+          return res.status(404).send({ success: false, message: "Wishlist item not found" });
+        }
+        res.send({ success: true, deletedCount: result.deletedCount });
+      } catch (error) {
+        res.status(500).send({ success: false, message: "Failed to remove wishlist item" });
+      }
     });
   } catch (error) {
     res
