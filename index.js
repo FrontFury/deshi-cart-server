@@ -232,6 +232,32 @@ app.get("/api/users", verifyToken, verifyAdmin, async (req, res) => {
   }
 });
 
+app.patch("/api/users/:id/role", verifyToken, verifyAdmin, async (req, res) => {
+  try {
+    const { role } = req.body;
+    const allowedRoles = ["customer", "seller", "admin"];
+    if (!allowedRoles.includes(role) || !ObjectId.isValid(req.params.id)) {
+      return res.status(400).send({ success: false, message: "Invalid user role or user ID" });
+    }
+
+    const targetUser = await userCollection.findOne({ _id: new ObjectId(req.params.id) });
+    if (!targetUser) {
+      return res.status(404).send({ success: false, message: "User not found" });
+    }
+    if (targetUser.email === req.user.email && role !== "admin") {
+      return res.status(400).send({ success: false, message: "You cannot remove your own admin role" });
+    }
+
+    const result = await userCollection.updateOne(
+      { _id: new ObjectId(req.params.id) },
+      { $set: { role, updatedAt: new Date() } },
+    );
+    res.send({ success: true, modifiedCount: result.modifiedCount });
+  } catch (error) {
+    res.status(500).send({ success: false, message: "Failed to update user role" });
+  }
+});
+
 app.get("/api/users/role/:email", verifyToken, async (req, res) => {
   try {
     const email = req.params.email;
