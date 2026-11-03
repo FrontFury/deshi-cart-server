@@ -2,15 +2,20 @@ import dotenv from "dotenv";
 import express from "express";
 import cors from "cors";
 import { MongoClient, ServerApiVersion, ObjectId } from "mongodb";
-import { getApps, initializeApp } from "firebase-admin/app";
+import { getApps, initializeApp, cert } from "firebase-admin/app";
 import { getAuth } from "firebase-admin/auth";
+import { readFileSync } from "node:fs";
 
 dotenv.config();
 
+const firebaseServiceAccount = process.env.FIREBASE_SERVICE_ACCOUNT
+  ? JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT)
+  : JSON.parse(readFileSync(new URL("./deshi-cart-e6902.json", import.meta.url), "utf8"));
 const firebaseApp = getApps().length
   ? getApps()[0]
   : initializeApp({
-      projectId: process.env.FIREBASE_PROJECT_ID || "deshi-cart-e6902",
+      credential: cert(firebaseServiceAccount),
+      projectId: process.env.FIREBASE_PROJECT_ID || firebaseServiceAccount.project_id,
     });
 const firebaseAuth = getAuth(firebaseApp);
 
@@ -114,8 +119,9 @@ const verifyToken = async (req, res, next) => {
     return res.status(403).send({ message: "forbidden access" });
   }
   let user;
+  let decodedToken;
   try {
-    const decodedToken = await firebaseAuth.verifyIdToken(token);
+    decodedToken = await firebaseAuth.verifyIdToken(token);
     user = await userCollection.findOne({ email: decodedToken.email });
   } catch (firebaseError) {
     const session = await sessionCollection.findOne({ token });
@@ -123,6 +129,19 @@ const verifyToken = async (req, res, next) => {
       return res.status(401).send({ message: "unauthorized token" });
     }
     user = await userCollection.findOne({ _id: new ObjectId(session.userId) });
+  }
+  if (!user && decodedToken?.email) {
+    user = {
+      uid: decodedToken.uid,
+      email: decodedToken.email,
+      name: decodedToken.name || "",
+      photoURL: decodedToken.picture || "",
+      role: "customer",
+      provider: decodedToken.firebase?.sign_in_provider || "password",
+      createdAt: new Date(),
+    };
+    const result = await userCollection.insertOne(user);
+    user._id = result.insertedId;
   }
   if (!user) {
     return res.status(401).send({ message: "user not found" });
@@ -132,11 +151,22 @@ const verifyToken = async (req, res, next) => {
 };
 
 const verifyAdmin = async (req, res, next) => {
-  if (req.user?.role !== "admin") {
+  if (String(req.user?.role).toLowerCase() !== "admin") {
     return res.status(403).send({ message: "admin forbidden access" });
   }
   next();
 };
+
+const verifyRole = (...allowedRoles) => (req, res, next) => {
+  const role = String(req.user?.role || "").trim().toLowerCase();
+  if (!allowedRoles.includes(role)) {
+    return res.status(403).send({ message: "You do not have permission to access this resource" });
+  }
+  next();
+};
+
+const verifyCustomer = verifyRole("customer");
+const verifySeller = verifyRole("seller", "shopkeeper", "shopkeeperrole");
 
 const attachUserIfAuthenticated = async (req, _res, next) => {
   const authHeader = req.headers?.authorization;
@@ -167,12 +197,10 @@ app.post("/api/users", async (req, res) => {
     const user = req.body;
     const userExists = await userCollection.findOne({ email: user.email });
     if (userExists) {
-      return res
-        .status(409)
-        .send({ success: false, message: "User already exists" });
+      return res.send({ success: true, alreadyExists: true });
     }
 
-    user.role = user.role || "customer";
+    user.role = "customer";
     user.createdAt = new Date();
 
     const result = await userCollection.insertOne(user);
@@ -230,7 +258,7 @@ app.get("/api/products", attachUserIfAuthenticated, async (req, res) => {
   try {
     const query = {};
     const requestedStatus = req.query.status;
-    const isAdmin = req.user?.role === "admin";
+    const isAdmin = String(req.user?.role || "").toLowerCase() === "admin";
 
     if (requestedStatus === "pending" && !isAdmin) {
       return res.status(403).send({ success: false, message: "Admin access required" });
@@ -258,7 +286,7 @@ app.get("/api/products", attachUserIfAuthenticated, async (req, res) => {
   }
 });
 
-app.post("/api/products", verifyToken, async (req, res) => {
+app.post("/api/products", verifyToken, verifySeller, async (req, res) => {
   try {
     const product = {
       ...req.body,
@@ -298,7 +326,7 @@ app.patch("/api/products/:id/status", verifyToken, verifyAdmin, async (req, res)
 // ================= CART API ROUTES =================
 
 // Add item to cart (or update quantity if already exists for user)
-app.post("/api/cart", verifyToken, async (req, res) => {
+app.post("/api/cart", verifyToken, verifyCustomer, async (req, res) => {
   try {
     const { productId, name, price, image, quantity = 1 } = req.body;
     const email = req.user.email;
@@ -307,6 +335,14 @@ app.post("/api/cart", verifyToken, async (req, res) => {
       return res
         .status(400)
         .send({ success: false, message: "Product ID is required" });
+    }
+
+    const productQuery = ObjectId.isValid(String(productId))
+      ? { _id: new ObjectId(String(productId)) }
+      : { _id: productId };
+    const product = await productCollection.findOne(productQuery);
+    if (!product) {
+      return res.status(404).send({ success: false, message: "Product not found" });
     }
 
     // Check if the item already exists in the user's cart
@@ -319,39 +355,28 @@ app.post("/api/cart", verifyToken, async (req, res) => {
         { email, productId },
         { $set: { quantity: updatedQuantity } },
       );
+      if (!existingCartItem.sellerEmail && product.sellerEmail) {
+        await cartCollection.updateOne(
+          { _id: existingCartItem._id },
+          { $set: { sellerEmail: product.sellerEmail, category: product.category } },
+        );
+      }
       return res.send({
         success: true,
         message: "Cart item quantity updated",
         result,
       });
 
-      app.patch("/api/cart/:id", verifyToken, async (req, res) => {
-        try {
-          const quantity = Number(req.body.quantity);
-          if (!ObjectId.isValid(req.params.id) || !Number.isInteger(quantity) || quantity < 1) {
-            return res.status(400).send({ success: false, message: "A valid quantity is required" });
-          }
-
-          const result = await cartCollection.updateOne(
-            { _id: new ObjectId(req.params.id), email: req.user.email },
-            { $set: { quantity } },
-          );
-          if (!result.matchedCount) {
-            return res.status(404).send({ success: false, message: "Cart item not found" });
-          }
-          res.send({ success: true, modifiedCount: result.modifiedCount });
-        } catch (error) {
-          res.status(500).send({ success: false, message: "Failed to update cart item" });
-        }
-      });
     } else {
       // Insert new cart item
       const newCartItem = {
         email,
         productId,
         name,
+        category: product.category,
         price,
         image,
+        sellerEmail: product.sellerEmail,
         quantity,
         createdAt: new Date(),
       };
@@ -363,6 +388,7 @@ app.post("/api/cart", verifyToken, async (req, res) => {
           message: "Added to cart successfully",
           insertedId: result.insertedId,
         });
+
     }
   } catch (error) {
     res
@@ -375,8 +401,28 @@ app.post("/api/cart", verifyToken, async (req, res) => {
   }
 });
 
+app.patch("/api/cart/:id", verifyToken, verifyCustomer, async (req, res) => {
+  try {
+    const quantity = Number(req.body.quantity);
+    if (!ObjectId.isValid(req.params.id) || !Number.isInteger(quantity) || quantity < 1) {
+      return res.status(400).send({ success: false, message: "A valid quantity is required" });
+    }
+
+    const result = await cartCollection.updateOne(
+      { _id: new ObjectId(req.params.id), email: req.user.email },
+      { $set: { quantity } },
+    );
+    if (!result.matchedCount) {
+      return res.status(404).send({ success: false, message: "Cart item not found" });
+    }
+    res.send({ success: true, modifiedCount: result.modifiedCount });
+  } catch (error) {
+    res.status(500).send({ success: false, message: "Failed to update cart item" });
+  }
+});
+
 // Get cart items for the logged-in user
-app.get("/api/cart", verifyToken, async (req, res) => {
+app.get("/api/cart", verifyToken, verifyCustomer, async (req, res) => {
   try {
     const email = req.user.email;
     const cartItems = await cartCollection.find({ email }).toArray();
@@ -393,7 +439,7 @@ app.get("/api/cart", verifyToken, async (req, res) => {
 });
 
 // Delete a single item from the cart by its ID
-app.delete("/api/cart/:id", verifyToken, async (req, res) => {
+app.delete("/api/cart/:id", verifyToken, verifyCustomer, async (req, res) => {
   try {
     const id = req.params.id;
     if (!ObjectId.isValid(id)) {
@@ -430,7 +476,7 @@ app.delete("/api/cart/:id", verifyToken, async (req, res) => {
 });
 
 // Clear user's cart (useful after order checkout)
-app.delete("/api/cart", verifyToken, async (req, res) => {
+app.delete("/api/cart", verifyToken, verifyCustomer, async (req, res) => {
   try {
     const email = req.user.email;
     const result = await cartCollection.deleteMany({ email });
@@ -450,7 +496,7 @@ app.delete("/api/cart", verifyToken, async (req, res) => {
   }
 });
 
-app.get("/api/wishlist", verifyToken, async (req, res) => {
+app.get("/api/wishlist", verifyToken, verifyCustomer, async (req, res) => {
   try {
     const items = await wishlistCollection.find({ email: req.user.email }).sort({ createdAt: -1 }).toArray();
     res.send(items);
@@ -459,7 +505,7 @@ app.get("/api/wishlist", verifyToken, async (req, res) => {
   }
 });
 
-app.post("/api/wishlist", verifyToken, async (req, res) => {
+app.post("/api/wishlist", verifyToken, verifyCustomer, async (req, res) => {
   try {
     const { productId, name, category, price, image } = req.body;
     if (!productId || !name || !image) {
@@ -486,7 +532,7 @@ app.post("/api/wishlist", verifyToken, async (req, res) => {
   }
 });
 
-app.delete("/api/wishlist/:id", verifyToken, async (req, res) => {
+app.delete("/api/wishlist/:id", verifyToken, verifyCustomer, async (req, res) => {
   try {
     if (!ObjectId.isValid(req.params.id)) {
       return res.status(400).send({ success: false, message: "Invalid wishlist item ID" });
@@ -506,16 +552,56 @@ app.delete("/api/wishlist/:id", verifyToken, async (req, res) => {
 
 // ================= ORDER API ROUTES =================
 
-app.post("/api/orders", verifyToken, async (req, res) => {
+app.post("/api/orders", verifyToken, verifyCustomer, async (req, res) => {
   try {
-    const order = req.body;
-    order.email = req.user.email; // bind order to current user
-    order.status = "Pending";
-    order.createdAt = new Date();
+    const { name, number, location } = req.body;
+    if (!name || !number || !location) {
+      return res.status(400).send({ success: false, message: "Name, phone number and location are required" });
+    }
+
+    const cartItems = await cartCollection.find({ email: req.user.email }).toArray();
+    if (!cartItems.length) {
+      return res.status(400).send({ success: false, message: "Your cart is empty" });
+    }
+
+    const subtotal = cartItems.reduce(
+      (sum, item) => sum + (Number(item.price) || 0) * (Number(item.quantity) || 0),
+      0,
+    );
+    const deliveryFee = 80;
+    const items = await Promise.all(cartItems.map(async (item) => {
+      const productQuery = ObjectId.isValid(String(item.productId))
+        ? { _id: new ObjectId(String(item.productId)) }
+        : { _id: item.productId };
+      const product = await productCollection.findOne(productQuery, {
+        projection: { sellerEmail: 1, category: 1 },
+      });
+      return {
+        productId: item.productId,
+        name: item.name,
+        category: item.category || product?.category || "",
+        price: Number(item.price) || 0,
+        image: item.image,
+        quantity: Number(item.quantity) || 1,
+        sellerEmail: item.sellerEmail || product?.sellerEmail || "",
+        status: "Pending",
+      };
+    }));
+    const order = {
+      name,
+      number,
+      location,
+      email: req.user.email,
+      items,
+      subtotal,
+      deliveryFee,
+      total: subtotal + deliveryFee,
+      status: "Pending",
+      createdAt: new Date(),
+    };
 
     const result = await orderCollection.insertOne(order);
 
-    // Optional: Clear user's cart automatically after a successful order
     await cartCollection.deleteMany({ email: req.user.email });
 
     res
@@ -530,18 +616,59 @@ app.post("/api/orders", verifyToken, async (req, res) => {
   }
 });
 
-app.get("/api/orders", verifyToken, async (req, res) => {
+app.get("/api/orders", verifyToken, verifyRole("admin", "customer", "seller", "shopkeeper", "shopkeeperrole"), async (req, res) => {
   try {
-    const query = req.user.role === "admin" ? {} : { email: req.user.email };
+    const role = String(req.user.role || "").trim().toLowerCase();
+    const query = role === "admin"
+      ? {}
+      : ["seller", "shopkeeper", "shopkeeperrole"].includes(role)
+      ? { "items.sellerEmail": req.user.email }
+      : { email: req.user.email };
     const orders = await orderCollection.find(query).toArray();
+    if (["seller", "shopkeeper", "shopkeeperrole"].includes(role)) {
+      return res.send(orders.map((order) => ({
+        ...order,
+        items: order.items.filter((item) => item.sellerEmail === req.user.email),
+      })));
+    }
     res.send(orders);
   } catch (error) {
     res.status(500).send({ success: false, message: "Failed to fetch orders" });
   }
 });
 
+app.patch("/api/orders/:id/status", verifyToken, verifySeller, async (req, res) => {
+  try {
+    const { status } = req.body;
+    const validStatuses = ["Pending", "Processing", "Shipped", "Delivered", "Cancelled"];
+    if (!validStatuses.includes(status) || !ObjectId.isValid(req.params.id)) {
+      return res.status(400).send({ success: false, message: "Invalid order status" });
+    }
 
-app.post("/api/customer/profile", verifyToken, async (req, res) => {
+    const result = await orderCollection.updateOne(
+      {
+        _id: new ObjectId(req.params.id),
+        "items.sellerEmail": req.user.email,
+      },
+      {
+        $set: {
+          "items.$[sellerItem].status": status,
+          updatedAt: new Date(),
+        },
+      },
+      { arrayFilters: [{ "sellerItem.sellerEmail": req.user.email }] },
+    );
+    if (!result.matchedCount) {
+      return res.status(404).send({ success: false, message: "Order not found for this seller" });
+    }
+    res.send({ success: true, modifiedCount: result.modifiedCount });
+  } catch (error) {
+    res.status(500).send({ success: false, message: "Failed to update order status" });
+  }
+});
+
+
+app.post("/api/customer/profile", verifyToken, verifyCustomer, async (req, res) => {
   try {
     const email = req.user.email;
     const profileData = req.body;
@@ -571,7 +698,7 @@ app.post("/api/customer/profile", verifyToken, async (req, res) => {
 });
 
 // 2. READ (Get Customer Profile by Email)
-app.get("/api/customer/profile", verifyToken, async (req, res) => {
+app.get("/api/customer/profile", verifyToken, verifyCustomer, async (req, res) => {
   try {
     const email = req.query.email || req.user.email;
     const profile = await customerProfileCollection.findOne({ email });
@@ -587,7 +714,7 @@ app.get("/api/customer/profile", verifyToken, async (req, res) => {
 });
 
 // 3. UPDATE (Modify Customer Profile fields)
-app.patch("/api/customer/profile", verifyToken, async (req, res) => {
+app.patch("/api/customer/profile", verifyToken, verifyCustomer, async (req, res) => {
   try {
     const email = req.user.email;
     const updatedData = req.body;
@@ -610,7 +737,7 @@ app.patch("/api/customer/profile", verifyToken, async (req, res) => {
 });
 
 // 4. DELETE (Remove Customer Profile)
-app.delete("/api/customer/profile", verifyToken, async (req, res) => {
+app.delete("/api/customer/profile", verifyToken, verifyCustomer, async (req, res) => {
   try {
     const email = req.user.email;
     const result = await customerProfileCollection.deleteOne({ email });
@@ -629,7 +756,7 @@ app.delete("/api/customer/profile", verifyToken, async (req, res) => {
 // ================= SELLER PROFILE CRUD =================
 
 // 1. CREATE / UPDATE (Upsert) Seller Profile
-app.post("/api/seller/profile", verifyToken, async (req, res) => {
+app.post("/api/seller/profile", verifyToken, verifySeller, async (req, res) => {
   try {
     const email = req.user.email;
     const profileData = req.body;
@@ -659,7 +786,7 @@ app.post("/api/seller/profile", verifyToken, async (req, res) => {
 });
 
 // 2. READ (Get Seller Profile by Email)
-app.get("/api/seller/profile", verifyToken, async (req, res) => {
+app.get("/api/seller/profile", verifyToken, verifySeller, async (req, res) => {
   try {
     const email = req.query.email || req.user.email;
     const profile = await sellerProfileCollection.findOne({ email });
@@ -675,7 +802,7 @@ app.get("/api/seller/profile", verifyToken, async (req, res) => {
 });
 
 // 3. UPDATE (Modify Seller Profile fields)
-app.patch("/api/seller/profile", verifyToken, async (req, res) => {
+app.patch("/api/seller/profile", verifyToken, verifySeller, async (req, res) => {
   try {
     const email = req.user.email;
     const updatedData = req.body;
@@ -698,7 +825,7 @@ app.patch("/api/seller/profile", verifyToken, async (req, res) => {
 });
 
 // 4. DELETE (Remove Seller Profile)
-app.delete("/api/seller/profile", verifyToken, async (req, res) => {
+app.delete("/api/seller/profile", verifyToken, verifySeller, async (req, res) => {
   try {
     const email = req.user.email;
     const result = await sellerProfileCollection.deleteOne({ email });
